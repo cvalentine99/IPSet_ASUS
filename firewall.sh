@@ -1013,51 +1013,150 @@ Extended_DNSStats() {
 	esac
 }
 
-#######################
-#- Splunk Integration -#
-#######################
+##############################################
+#- Splunk ES IDS_Attacks Integration + OTX -#
+##############################################
 
-# Send events to Splunk HEC with CIM Network Traffic field mapping
+# Fetch full OTX threat intel for an IP (general + malware + reputation)
+# Sets global variables: otx_pulse_count, otx_reputation, otx_country, otx_asn, otx_tags, otx_malware, otx_threat_score
+# Usage: OTX_Enrich <ip_address>
+OTX_Enrich() {
+	_tip="$1"
+	otx_cache="/tmp/skynet/otx_cache"
+	mkdir -p "$otx_cache"
+
+	# Reset globals
+	otx_pulse_count="0"; otx_reputation="0"; otx_country=""; otx_asn=""
+	otx_tags=""; otx_malware=""; otx_threat_score="0"
+
+	[ -z "$otxapikey" ] || [ -z "$_tip" ] && return 1
+
+	# Check cache (24h TTL)
+	_cache_general="${otx_cache}/${_tip}_general.json"
+	_cache_malware="${otx_cache}/${_tip}_malware.json"
+
+	# Fetch general intel
+	_general=""
+	if [ -f "$_cache_general" ]; then
+		_age=$(($(date +%s) - $(stat -c %Y "$_cache_general" 2>/dev/null || echo 0)))
+		[ "$_age" -lt 86400 ] && _general="$(cat "$_cache_general")"
+	fi
+	if [ -z "$_general" ]; then
+		_general="$(curl -fsSL --retry 2 --connect-timeout 5 --max-time 10 \
+			-H "X-OTX-API-KEY: ${otxapikey}" \
+			"https://otx.alienvault.com/api/v1/indicators/IPv4/${_tip}/general" 2>/dev/null)"
+		[ -n "$_general" ] && echo "$_general" > "$_cache_general"
+	fi
+
+	# Fetch malware intel
+	_malware=""
+	if [ -f "$_cache_malware" ]; then
+		_age=$(($(date +%s) - $(stat -c %Y "$_cache_malware" 2>/dev/null || echo 0)))
+		[ "$_age" -lt 86400 ] && _malware="$(cat "$_cache_malware")"
+	fi
+	if [ -z "$_malware" ]; then
+		_malware="$(curl -fsSL --retry 2 --connect-timeout 5 --max-time 10 \
+			-H "X-OTX-API-KEY: ${otxapikey}" \
+			"https://otx.alienvault.com/api/v1/indicators/IPv4/${_tip}/malware" 2>/dev/null)"
+		[ -n "$_malware" ] && echo "$_malware" > "$_cache_malware"
+	fi
+
+	# Parse general intel
+	if [ -n "$_general" ]; then
+		otx_pulse_count="$(echo "$_general" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)"
+		otx_reputation="$(echo "$_general" | grep -o '"reputation":[0-9]*' | cut -d: -f2)"
+		otx_country="$(echo "$_general" | grep -o '"country_code":"[^"]*"' | cut -d'"' -f4)"
+		otx_asn="$(echo "$_general" | grep -o '"asn":"[^"]*"' | cut -d'"' -f4)"
+		otx_tags="$(echo "$_general" | grep -o '"tags":\[[^]]*\]' | head -1 | tr -d '[]"' | tr ',' ';' | cut -c1-100)"
+	fi
+
+	# Parse malware intel
+	if [ -n "$_malware" ] && echo "$_malware" | grep -q '"data":\['; then
+		otx_malware="$(echo "$_malware" | grep -o '"hash":"[^"]*"' | head -3 | cut -d'"' -f4 | tr '\n' ';' | sed 's/;$//')"
+	fi
+
+	# Calculate threat score (0-100)
+	otx_threat_score=0
+	[ "${otx_pulse_count:-0}" -gt 0 ] && otx_threat_score=$((otx_threat_score + 25))
+	[ "${otx_pulse_count:-0}" -gt 5 ] && otx_threat_score=$((otx_threat_score + 25))
+	[ "${otx_pulse_count:-0}" -gt 20 ] && otx_threat_score=$((otx_threat_score + 25))
+	[ -n "$otx_malware" ] && otx_threat_score=$((otx_threat_score + 25))
+
+	return 0
+}
+
+# Get IDS severity based on block type and OTX threat score
+# Usage: Get_IDS_Severity <block_type> <otx_threat_score>
+Get_IDS_Severity() {
+	_btype="$1"
+	_tscore="${2:-0}"
+
+	# Outbound to malicious = critical (possible C2/infection)
+	[ "$_btype" = "OUTBOUND" ] && [ "$_tscore" -ge 50 ] && echo "critical" && return
+	[ "$_btype" = "OUTBOUND" ] && echo "high" && return
+
+	# High OTX score = high severity
+	[ "$_tscore" -ge 75 ] && echo "high" && return
+	[ "$_tscore" -ge 50 ] && echo "medium" && return
+
+	# Default by block type
+	case "$_btype" in
+		INBOUND)  echo "medium" ;;
+		INVALID)  echo "low" ;;
+		IOT)      echo "medium" ;;
+		*)        echo "informational" ;;
+	esac
+}
+
+# Get IDS category based on block type
+Get_IDS_Category() {
+	case "$1" in
+		INBOUND)  echo "Unauthorized Access Attempt" ;;
+		OUTBOUND) echo "Command and Control" ;;
+		INVALID)  echo "Protocol Anomaly" ;;
+		IOT)      echo "Policy Violation" ;;
+		*)        echo "Firewall Block" ;;
+	esac
+}
+
+# Send events to Splunk HEC formatted for Intrusion_Detection.IDS_Attacks
 # Usage: Send_To_Splunk [batch_size]
 Send_To_Splunk() {
 	if ! Is_Enabled "$splunkhec" || [ -z "$splunkhecurl" ] || [ -z "$splunkhectoken" ]; then
 		return 1
 	fi
 
-	batch_size="${1:-100}"
+	batch_size="${1:-50}"
 	splunk_batch_file="/tmp/skynet/splunk_batch.json"
 	splunk_sent_marker="${skynetloc}/.splunk_last_sent"
-	hostname="$(nvram get lan_hostname)"
-	wan_ip="$(nvram get wan0_ipaddr)"
+	_hostname="$(nvram get lan_hostname)"
+	_wan_ip="$(nvram get wan0_ipaddr)"
+	_model="$(nvram get model 2>/dev/null || echo "ASUS")"
 
-	# Get last sent timestamp or start from beginning
+	# Get last sent position
 	if [ -f "$splunk_sent_marker" ]; then
 		last_sent="$(cat "$splunk_sent_marker")"
 	else
 		last_sent="0"
 	fi
 
-	# Process skynet.log entries and convert to CIM-compliant JSON
 	event_count=0
 	newest_epoch="$last_sent"
 	printf '' > "$splunk_batch_file"
 
 	while IFS= read -r line; do
-		# Parse syslog format: Month Day HH:MM:SS hostname kernel: [BLOCKED - TYPE] ...
+		# Parse timestamp
 		log_month="$(echo "$line" | awk '{print $1}')"
 		log_day="$(echo "$line" | awk '{print $2}')"
 		log_time="$(echo "$line" | awk '{print $3}')"
-
-		# Convert to epoch timestamp
 		log_epoch="$(date -d "$log_month $log_day $log_time" +%s 2>/dev/null || date +%s)"
 
-		# Skip if already sent
 		[ "$log_epoch" -le "$last_sent" ] && continue
 
-		# Extract block type (INBOUND, OUTBOUND, INVALID, IOT)
+		# Parse iptables log
 		block_type="$(echo "$line" | grep -oE 'BLOCKED - [A-Z]+' | cut -d' ' -f3)"
+		[ -z "$block_type" ] && continue
 
-		# Extract network fields from iptables log
 		src_ip="$(echo "$line" | grep -oE 'SRC=[0-9.]+' | cut -d= -f2)"
 		dst_ip="$(echo "$line" | grep -oE 'DST=[0-9.]+' | cut -d= -f2)"
 		src_port="$(echo "$line" | grep -oE 'SPT=[0-9]+' | cut -d= -f2)"
@@ -1068,44 +1167,53 @@ Send_To_Splunk() {
 		mac_addr="$(echo "$line" | grep -oE 'MAC=[0-9a-f:]+' | cut -d= -f2)"
 		ttl="$(echo "$line" | grep -oE 'TTL=[0-9]+' | cut -d= -f2)"
 		pkt_len="$(echo "$line" | grep -oE 'LEN=[0-9]+' | cut -d= -f2)"
-		tcp_flags="$(echo "$line" | grep -oE 'RES=0x[0-9a-f]+ [A-Z ]+ URGP' | sed 's/RES=0x[0-9a-f]* //;s/ URGP//')"
 
-		# Determine direction and threat IP based on block type
+		# Determine threat IP
 		case "$block_type" in
-			INBOUND|INVALID)
-				direction="inbound"
-				threat_ip="$src_ip"
-				;;
-			OUTBOUND)
-				direction="outbound"
-				threat_ip="$dst_ip"
-				;;
-			IOT)
-				direction="internal"
-				threat_ip="$src_ip"
-				;;
-			*)
-				direction="unknown"
-				threat_ip=""
-				;;
+			INBOUND|INVALID) threat_ip="$src_ip"; direction="inbound" ;;
+			OUTBOUND)        threat_ip="$dst_ip"; direction="outbound" ;;
+			IOT)             threat_ip="$src_ip"; direction="internal" ;;
+			*)               threat_ip="$src_ip"; direction="unknown" ;;
 		esac
 
-		# Get ban reason for threat context
-		ban_reason=""
-		[ -n "$threat_ip" ] && ban_reason="$(Get_BanReason "$threat_ip" 2>/dev/null | tr '"' "'")"
+		# OTX Enrichment
+		OTX_Enrich "$threat_ip"
 
-		# Build CIM-compliant JSON event
-		# CIM Network Traffic fields: action, app, bytes, dest, dest_ip, dest_port, direction, dvc, protocol, src, src_ip, src_port, transport
-		printf '{"time":%s,"host":"%s","source":"skynet","sourcetype":"%s","index":"%s","event":{"action":"blocked","app":"skynet","bytes_in":"%s","dest":"%s","dest_ip":"%s","dest_port":"%s","direction":"%s","dvc":"%s","dvc_ip":"%s","ids_type":"network","protocol":"%s","signature":"%s","signature_id":"skynet_%s","src":"%s","src_ip":"%s","src_port":"%s","transport":"%s","ttl":"%s","vendor":"Skynet","vendor_product":"Skynet Firewall","rule":"%s","src_mac":"%s","tcp_flag":"%s","interface_in":"%s","interface_out":"%s","severity":"medium","category":"firewall"}}\n' \
-			"$log_epoch" "$hostname" "${splunksourcetype:-skynet:firewall}" "${splunkindex:-main}" \
-			"${pkt_len:-0}" "$dst_ip" "$dst_ip" "$dst_port" "$direction" "$hostname" "$wan_ip" \
-			"$protocol" "$block_type" "$block_type" "$src_ip" "$src_ip" "$src_port" "$protocol" \
-			"$ttl" "$ban_reason" "$mac_addr" "$tcp_flags" "$in_iface" "$out_iface" >> "$splunk_batch_file"
+		# Get severity and category
+		severity="$(Get_IDS_Severity "$block_type" "$otx_threat_score")"
+		category="$(Get_IDS_Category "$block_type")"
+
+		# Build signature with OTX context
+		ban_reason="$(Get_BanReason "$threat_ip" 2>/dev/null | tr '"' "'" | cut -c1-80)"
+		if [ -n "$otx_tags" ]; then
+			signature="Skynet ${block_type}: ${ban_reason:-Unknown} [OTX: ${otx_tags}]"
+		else
+			signature="Skynet ${block_type}: ${ban_reason:-Blocked IP}"
+		fi
+		signature="$(echo "$signature" | cut -c1-200)"
+
+		# Build IDS_Attacks compliant event
+		printf '{"time":%s,"host":"%s","source":"skynet","sourcetype":"%s","index":"%s","event":{' \
+			"$log_epoch" "$_hostname" "${splunksourcetype:-skynet:ids}" "${splunkindex:-main}" >> "$splunk_batch_file"
+		printf '"action":"blocked","app":"skynet","category":"%s","dest":"%s","dest_ip":"%s","dest_port":"%s",' \
+			"$category" "$dst_ip" "$dst_ip" "${dst_port:-0}" >> "$splunk_batch_file"
+		printf '"direction":"%s","dvc":"%s","dvc_ip":"%s","ids_type":"network","severity":"%s",' \
+			"$direction" "$_hostname" "$_wan_ip" "$severity" >> "$splunk_batch_file"
+		printf '"signature":"%s","signature_id":"skynet_%s_%s","src":"%s","src_ip":"%s","src_port":"%s",' \
+			"$signature" "$block_type" "$(echo "$threat_ip" | tr '.' '_')" "$src_ip" "$src_ip" "${src_port:-0}" >> "$splunk_batch_file"
+		printf '"transport":"%s","vendor":"Skynet","vendor_product":"Skynet Firewall %s",' \
+			"${protocol:-TCP}" "$_model" >> "$splunk_batch_file"
+		printf '"threat_ip":"%s","otx_pulse_count":"%s","otx_reputation":"%s","otx_country":"%s",' \
+			"$threat_ip" "${otx_pulse_count:-0}" "${otx_reputation:-0}" "$otx_country" >> "$splunk_batch_file"
+		printf '"otx_asn":"%s","otx_tags":"%s","otx_malware":"%s","otx_threat_score":"%s",' \
+			"$otx_asn" "$otx_tags" "$otx_malware" "${otx_threat_score:-0}" >> "$splunk_batch_file"
+		printf '"bytes":"%s","ttl":"%s","src_mac":"%s","src_interface":"%s","dest_interface":"%s"}}\n' \
+			"${pkt_len:-0}" "$ttl" "$mac_addr" "$in_iface" "$out_iface" >> "$splunk_batch_file"
 
 		event_count=$((event_count + 1))
 		newest_epoch="$log_epoch"
 
-		# Send batch when limit reached
+		# Send batch
 		if [ "$event_count" -ge "$batch_size" ]; then
 			if curl -fsSL --retry 2 --connect-timeout 5 --max-time 30 \
 				-H "Authorization: Splunk ${splunkhectoken}" \
@@ -1122,7 +1230,7 @@ Send_To_Splunk() {
 		fi
 	done < "$skynetlog"
 
-	# Send remaining events
+	# Send remaining
 	if [ "$event_count" -gt 0 ]; then
 		if curl -fsSL --retry 2 --connect-timeout 5 --max-time 30 \
 			-H "Authorization: Splunk ${splunkhectoken}" \
@@ -1130,6 +1238,7 @@ Send_To_Splunk() {
 			-d @"$splunk_batch_file" \
 			"${splunkhecurl}" >/dev/null 2>&1; then
 			echo "$newest_epoch" > "$splunk_sent_marker"
+			echo "[i] Sent $event_count IDS events to Splunk"
 		else
 			Log error "Splunk HEC final batch send failed"
 			return 1
@@ -6518,7 +6627,7 @@ case "$1" in
 
 				# Allowlist of safe functions that can be run via debug run
 				# These are utility and diagnostic functions that don't modify critical state
-				allowed_funcs="Check_Connection Check_Files Check_IPSets Check_IPTables Check_Lock Check_Security Check_Settings Check_Swap Display_Header Display_Message Display_Result Domain_Lookup Extended_DNSStats Export_ThreatIntel Fetch_OTX_Intel Filter_Date Filter_OutIP Filter_PrivateDST Filter_PrivateIP Filter_PrivateSRC Generate_Blocked_Events Generate_Stats Get_BanReason Get_LocalName Get_WebUI_Page Is_ASN Is_Enabled Is_IP Is_IPRange Is_MAC Is_Numeric Is_Path Is_Port Is_PrivateIP Is_Range Is_URL LAN_CIDR_Lookup Load_Menu Print_Log Purge_Logs Refresh_AiProtect Refresh_MBans Refresh_MWhitelist Save_IPSets Send_To_Splunk Show_Associated_Domains Strip_Domain Test_Splunk_HEC Whitelist_CDN Whitelist_Extra Whitelist_Shared Whitelist_VPN WriteData_ToJS WriteStats_ToJS"
+				allowed_funcs="Check_Connection Check_Files Check_IPSets Check_IPTables Check_Lock Check_Security Check_Settings Check_Swap Display_Header Display_Message Display_Result Domain_Lookup Extended_DNSStats Export_ThreatIntel Fetch_OTX_Intel Filter_Date Filter_OutIP Filter_PrivateDST Filter_PrivateIP Filter_PrivateSRC Generate_Blocked_Events Generate_Stats Get_BanReason Get_IDS_Category Get_IDS_Severity Get_LocalName Get_WebUI_Page Is_ASN Is_Enabled Is_IP Is_IPRange Is_MAC Is_Numeric Is_Path Is_Port Is_PrivateIP Is_Range Is_URL LAN_CIDR_Lookup Load_Menu OTX_Enrich Print_Log Purge_Logs Refresh_AiProtect Refresh_MBans Refresh_MWhitelist Save_IPSets Send_To_Splunk Show_Associated_Domains Strip_Domain Test_Splunk_HEC Whitelist_CDN Whitelist_Extra Whitelist_Shared Whitelist_VPN WriteData_ToJS WriteStats_ToJS"
 
 				# Check if function is in allowlist
 				allowed=0
