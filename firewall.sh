@@ -807,6 +807,9 @@ Unload_Cron() {
 			genstats)
 				cru d Skynet_genstats
 			;;
+			splunksync)
+				cru d Skynet_splunksync
+			;;
 			*)
 				echo "[*] Warning: Unknown Cron Job '$job'"
 			;;
@@ -839,6 +842,11 @@ Load_Cron() {
 			genstats)
 				min=$(Generate_Random_Number 28 57)
 				cru a Skynet_genstats "$min */12 * * * sh /jffs/scripts/firewall debug genstats"
+			;;
+			splunksync)
+				# Sync to Splunk every 15 minutes
+				min=$(Generate_Random_Number 0 14)
+				cru a Skynet_splunksync "$min,$(( (min + 15) % 60 )),$(( (min + 30) % 60 )),$(( (min + 45) % 60 )) * * * * sh /jffs/scripts/firewall settings splunk sync"
 			;;
 			*)
 				echo "[*] Warning: Unknown Cron Job '$job'"
@@ -1002,6 +1010,326 @@ Extended_DNSStats() {
 		*)
 			echo "[*] Error - No Stats Specified To Load"
 		;;
+	esac
+}
+
+#######################
+#- Splunk Integration -#
+#######################
+
+# Send events to Splunk HEC with CIM Network Traffic field mapping
+# Usage: Send_To_Splunk [batch_size]
+Send_To_Splunk() {
+	if ! Is_Enabled "$splunkhec" || [ -z "$splunkhecurl" ] || [ -z "$splunkhectoken" ]; then
+		return 1
+	fi
+
+	batch_size="${1:-100}"
+	splunk_batch_file="/tmp/skynet/splunk_batch.json"
+	splunk_sent_marker="${skynetloc}/.splunk_last_sent"
+	hostname="$(nvram get lan_hostname)"
+	wan_ip="$(nvram get wan0_ipaddr)"
+
+	# Get last sent timestamp or start from beginning
+	if [ -f "$splunk_sent_marker" ]; then
+		last_sent="$(cat "$splunk_sent_marker")"
+	else
+		last_sent="0"
+	fi
+
+	# Process skynet.log entries and convert to CIM-compliant JSON
+	event_count=0
+	newest_epoch="$last_sent"
+	printf '' > "$splunk_batch_file"
+
+	while IFS= read -r line; do
+		# Parse syslog format: Month Day HH:MM:SS hostname kernel: [BLOCKED - TYPE] ...
+		log_month="$(echo "$line" | awk '{print $1}')"
+		log_day="$(echo "$line" | awk '{print $2}')"
+		log_time="$(echo "$line" | awk '{print $3}')"
+
+		# Convert to epoch timestamp
+		log_epoch="$(date -d "$log_month $log_day $log_time" +%s 2>/dev/null || date +%s)"
+
+		# Skip if already sent
+		[ "$log_epoch" -le "$last_sent" ] && continue
+
+		# Extract block type (INBOUND, OUTBOUND, INVALID, IOT)
+		block_type="$(echo "$line" | grep -oE 'BLOCKED - [A-Z]+' | cut -d' ' -f3)"
+
+		# Extract network fields from iptables log
+		src_ip="$(echo "$line" | grep -oE 'SRC=[0-9.]+' | cut -d= -f2)"
+		dst_ip="$(echo "$line" | grep -oE 'DST=[0-9.]+' | cut -d= -f2)"
+		src_port="$(echo "$line" | grep -oE 'SPT=[0-9]+' | cut -d= -f2)"
+		dst_port="$(echo "$line" | grep -oE 'DPT=[0-9]+' | cut -d= -f2)"
+		protocol="$(echo "$line" | grep -oE 'PROTO=[A-Z]+' | cut -d= -f2)"
+		in_iface="$(echo "$line" | grep -oE 'IN=[a-z0-9]+' | cut -d= -f2)"
+		out_iface="$(echo "$line" | grep -oE 'OUT=[a-z0-9]*' | cut -d= -f2)"
+		mac_addr="$(echo "$line" | grep -oE 'MAC=[0-9a-f:]+' | cut -d= -f2)"
+		ttl="$(echo "$line" | grep -oE 'TTL=[0-9]+' | cut -d= -f2)"
+		pkt_len="$(echo "$line" | grep -oE 'LEN=[0-9]+' | cut -d= -f2)"
+		tcp_flags="$(echo "$line" | grep -oE 'RES=0x[0-9a-f]+ [A-Z ]+ URGP' | sed 's/RES=0x[0-9a-f]* //;s/ URGP//')"
+
+		# Determine direction and threat IP based on block type
+		case "$block_type" in
+			INBOUND|INVALID)
+				direction="inbound"
+				threat_ip="$src_ip"
+				;;
+			OUTBOUND)
+				direction="outbound"
+				threat_ip="$dst_ip"
+				;;
+			IOT)
+				direction="internal"
+				threat_ip="$src_ip"
+				;;
+			*)
+				direction="unknown"
+				threat_ip=""
+				;;
+		esac
+
+		# Get ban reason for threat context
+		ban_reason=""
+		[ -n "$threat_ip" ] && ban_reason="$(Get_BanReason "$threat_ip" 2>/dev/null | tr '"' "'")"
+
+		# Build CIM-compliant JSON event
+		# CIM Network Traffic fields: action, app, bytes, dest, dest_ip, dest_port, direction, dvc, protocol, src, src_ip, src_port, transport
+		printf '{"time":%s,"host":"%s","source":"skynet","sourcetype":"%s","index":"%s","event":{"action":"blocked","app":"skynet","bytes_in":"%s","dest":"%s","dest_ip":"%s","dest_port":"%s","direction":"%s","dvc":"%s","dvc_ip":"%s","ids_type":"network","protocol":"%s","signature":"%s","signature_id":"skynet_%s","src":"%s","src_ip":"%s","src_port":"%s","transport":"%s","ttl":"%s","vendor":"Skynet","vendor_product":"Skynet Firewall","rule":"%s","src_mac":"%s","tcp_flag":"%s","interface_in":"%s","interface_out":"%s","severity":"medium","category":"firewall"}}\n' \
+			"$log_epoch" "$hostname" "${splunksourcetype:-skynet:firewall}" "${splunkindex:-main}" \
+			"${pkt_len:-0}" "$dst_ip" "$dst_ip" "$dst_port" "$direction" "$hostname" "$wan_ip" \
+			"$protocol" "$block_type" "$block_type" "$src_ip" "$src_ip" "$src_port" "$protocol" \
+			"$ttl" "$ban_reason" "$mac_addr" "$tcp_flags" "$in_iface" "$out_iface" >> "$splunk_batch_file"
+
+		event_count=$((event_count + 1))
+		newest_epoch="$log_epoch"
+
+		# Send batch when limit reached
+		if [ "$event_count" -ge "$batch_size" ]; then
+			if curl -fsSL --retry 2 --connect-timeout 5 --max-time 30 \
+				-H "Authorization: Splunk ${splunkhectoken}" \
+				-H "Content-Type: application/json" \
+				-d @"$splunk_batch_file" \
+				"${splunkhecurl}" >/dev/null 2>&1; then
+				echo "$newest_epoch" > "$splunk_sent_marker"
+				printf '' > "$splunk_batch_file"
+				event_count=0
+			else
+				Log error "Splunk HEC batch send failed"
+				return 1
+			fi
+		fi
+	done < "$skynetlog"
+
+	# Send remaining events
+	if [ "$event_count" -gt 0 ]; then
+		if curl -fsSL --retry 2 --connect-timeout 5 --max-time 30 \
+			-H "Authorization: Splunk ${splunkhectoken}" \
+			-H "Content-Type: application/json" \
+			-d @"$splunk_batch_file" \
+			"${splunkhecurl}" >/dev/null 2>&1; then
+			echo "$newest_epoch" > "$splunk_sent_marker"
+		else
+			Log error "Splunk HEC final batch send failed"
+			return 1
+		fi
+	fi
+
+	rm -f "$splunk_batch_file"
+	return 0
+}
+
+# Fetch threat intelligence from OTX and format for Splunk ES
+# Usage: Fetch_OTX_Intel <ip_address>
+Fetch_OTX_Intel() {
+	if [ -z "$otxapikey" ] || [ -z "$1" ]; then
+		return 1
+	fi
+
+	_ip="$1"
+	otx_cache="/tmp/skynet/otx_cache"
+	mkdir -p "$otx_cache"
+	cache_file="${otx_cache}/${_ip}.json"
+
+	# Use cache if less than 24 hours old
+	if [ -f "$cache_file" ]; then
+		cache_age=$(($(date +%s) - $(date -r "$cache_file" +%s 2>/dev/null || echo 0)))
+		if [ "$cache_age" -lt 86400 ]; then
+			cat "$cache_file"
+			return 0
+		fi
+	fi
+
+	# Fetch from OTX API
+	otx_data="$(curl -fsSL --retry 2 --connect-timeout 5 --max-time 15 \
+		-H "X-OTX-API-KEY: ${otxapikey}" \
+		"https://otx.alienvault.com/api/v1/indicators/IPv4/${_ip}/general" 2>/dev/null)"
+
+	if [ -n "$otx_data" ]; then
+		echo "$otx_data" > "$cache_file"
+		echo "$otx_data"
+		return 0
+	fi
+
+	return 1
+}
+
+# Export threat intelligence to Splunk ES format
+# Usage: Export_ThreatIntel [output_file]
+Export_ThreatIntel() {
+	if ! Is_Enabled "$splunkhec" || [ -z "$splunkhecurl" ] || [ -z "$splunkhectoken" ]; then
+		echo "[*] Splunk HEC not configured"
+		return 1
+	fi
+
+	ti_batch_file="/tmp/skynet/ti_batch.json"
+	hostname="$(nvram get lan_hostname)"
+	export_time="$(date +%s)"
+
+	printf '' > "$ti_batch_file"
+	indicator_count=0
+
+	echo "[i] Exporting threat indicators to Splunk ES..."
+
+	# Process blacklisted IPs with ban reasons
+	grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" | while IFS= read -r line; do
+		ip_or_range="$(echo "$line" | awk '{print $3}')"
+		comment="$(echo "$line" | sed -n 's/.*comment "\([^"]*\)".*/\1/p' | tr '"' "'")"
+
+		# Determine threat type from comment
+		case "$comment" in
+			*Malware*|*BanMalware*)
+				threat_type="malware"
+				threat_category="malicious-activity"
+				;;
+			*Country*)
+				threat_type="geolocation"
+				threat_category="country-block"
+				;;
+			*Manual*|*ManualBan*)
+				threat_type="manual"
+				threat_category="suspicious-activity"
+				;;
+			*AiProtect*)
+				threat_type="ids"
+				threat_category="intrusion-detection"
+				;;
+			*)
+				threat_type="blocklist"
+				threat_category="suspicious-activity"
+				;;
+		esac
+
+		# Determine if IP or CIDR
+		case "$ip_or_range" in
+			*/*)
+				indicator_type="cidr"
+				;;
+			*)
+				indicator_type="ip"
+				;;
+		esac
+
+		# Fetch OTX enrichment if API key available
+		otx_pulse_count="0"
+		otx_reputation="0"
+		if [ -n "$otxapikey" ] && [ "$indicator_type" = "ip" ]; then
+			otx_info="$(Fetch_OTX_Intel "$ip_or_range" 2>/dev/null)"
+			if [ -n "$otx_info" ]; then
+				otx_pulse_count="$(echo "$otx_info" | grep -o '"pulse_info":{[^}]*"count":[0-9]*' | grep -o '[0-9]*$' || echo 0)"
+				otx_reputation="$(echo "$otx_info" | grep -o '"reputation":[0-9]*' | cut -d: -f2 || echo 0)"
+			fi
+		fi
+
+		# Build Splunk ES threat intel format
+		printf '{"time":%s,"host":"%s","source":"skynet","sourcetype":"%s","index":"%s","event":{"threat_key":"%s","threat_match_field":"src_ip,dest_ip","threat_match_value":"%s","threat_collection_name":"skynet_blocklist","threat_collection_key":"%s","description":"%s","threat_type":"%s","threat_category":"%s","indicator_type":"%s","confidence":"high","severity":"medium","source_feed":"Skynet Firewall","source_feed_id":"skynet","weight":"1","otx_pulse_count":"%s","otx_reputation":"%s"}}\n' \
+			"$export_time" "$hostname" "${splunksourcetype:-skynet:threatintel}" "${splunkindex:-main}" \
+			"$ip_or_range" "$ip_or_range" "$ip_or_range" "$comment" "$threat_type" "$threat_category" \
+			"$indicator_type" "$otx_pulse_count" "$otx_reputation" >> "$ti_batch_file"
+
+		indicator_count=$((indicator_count + 1))
+
+		# Batch send every 500 indicators
+		if [ "$indicator_count" -ge 500 ]; then
+			if curl -fsSL --retry 2 --connect-timeout 5 --max-time 60 \
+				-H "Authorization: Splunk ${splunkhectoken}" \
+				-H "Content-Type: application/json" \
+				-d @"$ti_batch_file" \
+				"${splunkhecurl}" >/dev/null 2>&1; then
+				printf '' > "$ti_batch_file"
+				indicator_count=0
+			else
+				Log error "Splunk threat intel batch send failed"
+			fi
+		fi
+	done
+
+	# Send remaining indicators
+	if [ -s "$ti_batch_file" ]; then
+		if curl -fsSL --retry 2 --connect-timeout 5 --max-time 60 \
+			-H "Authorization: Splunk ${splunkhectoken}" \
+			-H "Content-Type: application/json" \
+			-d @"$ti_batch_file" \
+			"${splunkhecurl}" >/dev/null 2>&1; then
+			echo "[i] Threat intelligence exported successfully"
+		else
+			Log error "Splunk threat intel final batch send failed"
+			return 1
+		fi
+	fi
+
+	rm -f "$ti_batch_file"
+
+	total_indicators="$(grep -cE '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset")"
+	echo "[i] Exported $total_indicators threat indicators"
+	return 0
+}
+
+# Test Splunk HEC connectivity
+Test_Splunk_HEC() {
+	if [ -z "$splunkhecurl" ] || [ -z "$splunkhectoken" ]; then
+		echo "[*] Splunk HEC URL or token not configured"
+		return 1
+	fi
+
+	hostname="$(nvram get lan_hostname)"
+	test_time="$(date +%s)"
+
+	test_event="{\"time\":${test_time},\"host\":\"${hostname}\",\"source\":\"skynet\",\"sourcetype\":\"${splunksourcetype:-skynet:firewall}\",\"index\":\"${splunkindex:-main}\",\"event\":{\"action\":\"test\",\"message\":\"Skynet HEC connectivity test\",\"vendor\":\"Skynet\",\"vendor_product\":\"Skynet Firewall\"}}"
+
+	echo "[i] Testing Splunk HEC connection..."
+	echo "[i] URL: $splunkhecurl"
+
+	response="$(curl -fsSL --retry 1 --connect-timeout 10 --max-time 15 \
+		-H "Authorization: Splunk ${splunkhectoken}" \
+		-H "Content-Type: application/json" \
+		-d "$test_event" \
+		-w "\n%{http_code}" \
+		"${splunkhecurl}" 2>&1)"
+
+	http_code="$(echo "$response" | tail -1)"
+	response_body="$(echo "$response" | sed '$d')"
+
+	case "$http_code" in
+		200)
+			echo "[i] Splunk HEC connection successful"
+			echo "[i] Response: $response_body"
+			return 0
+			;;
+		401)
+			echo "[*] Splunk HEC authentication failed - check token"
+			return 1
+			;;
+		403)
+			echo "[*] Splunk HEC forbidden - check token permissions"
+			return 1
+			;;
+		*)
+			echo "[*] Splunk HEC connection failed (HTTP $http_code)"
+			echo "[*] Response: $response_body"
+			return 1
+			;;
 	esac
 }
 
@@ -2585,6 +2913,13 @@ Write_Config() {
 		printf '%s="%s"\n' "lookupcountry" "$lookupcountry"
 		printf '%s="%s"\n' "cdnwhitelist" "$cdnwhitelist"
 		printf '%s="%s"\n' "displaywebui" "$displaywebui"
+		printf '\n%s\n' "## Splunk Integration ##"
+		printf '%s="%s"\n' "splunkhec" "$splunkhec"
+		printf '%s="%s"\n' "splunkhecurl" "$splunkhecurl"
+		printf '%s="%s"\n' "splunkhectoken" "$splunkhectoken"
+		printf '%s="%s"\n' "splunkindex" "$splunkindex"
+		printf '%s="%s"\n' "splunksourcetype" "$splunksourcetype"
+		printf '%s="%s"\n' "otxapikey" "$otxapikey"
 		printf '\n%s\n' "################################################"
 	} > "$skynetcfg"
 }
@@ -5644,6 +5979,120 @@ case "$1" in
 					;;
 				esac
 			;;
+			splunk)
+				case "$3" in
+					hec)
+						Check_Lock "$@"
+						if ! Check_IPSets || ! Check_IPTables; then echo "[*] Skynet Not Running - Exiting"; echo; exit 1; fi
+						case "$4" in
+							enable)
+								if [ -z "$5" ] || [ -z "$6" ]; then
+									echo "[*] Usage: firewall settings splunk hec enable <url> <token> [index] [sourcetype]"
+									echo "[*] Example: firewall settings splunk hec enable https://splunk.example.com:8088/services/collector/event abc123-token-xyz main skynet:firewall"
+									echo; exit 1
+								fi
+								if ! Is_URL "$5"; then
+									echo "[*] Invalid HEC URL format"
+									echo; exit 1
+								fi
+								Purge_Logs
+								splunkhec="enabled"
+								splunkhecurl="$5"
+								splunkhectoken="$6"
+								splunkindex="${7:-main}"
+								splunksourcetype="${8:-skynet:firewall}"
+								Unload_Cron "splunksync"
+								Load_Cron "splunksync"
+								echo "[i] Splunk HEC Enabled"
+								echo "[i] URL: $splunkhecurl"
+								echo "[i] Index: $splunkindex"
+								echo "[i] Sourcetype: $splunksourcetype"
+								echo "[i] Testing connection..."
+								Test_Splunk_HEC
+							;;
+							disable)
+								Purge_Logs
+								splunkhec="disabled"
+								Unload_Cron "splunksync"
+								echo "[i] Splunk HEC Disabled"
+							;;
+							*)
+								echo "[*] Usage: firewall settings splunk hec <enable|disable>"
+								Command_Not_Recognized
+							;;
+						esac
+					;;
+					otxkey)
+						Check_Lock "$@"
+						if ! Check_IPSets || ! Check_IPTables; then echo "[*] Skynet Not Running - Exiting"; echo; exit 1; fi
+						if [ -z "$4" ]; then
+							echo "[*] Usage: firewall settings splunk otxkey <api_key>"
+							echo "[*] Get your API key from https://otx.alienvault.com/api"
+							echo; exit 1
+						fi
+						Purge_Logs
+						otxapikey="$4"
+						echo "[i] OTX API Key Configured"
+						echo "[i] Testing OTX API..."
+						if Fetch_OTX_Intel "8.8.8.8" >/dev/null 2>&1; then
+							echo "[i] OTX API connection successful"
+						else
+							echo "[*] OTX API connection failed - check your API key"
+						fi
+					;;
+					test)
+						Check_Lock "$@"
+						if ! Check_IPSets || ! Check_IPTables; then echo "[*] Skynet Not Running - Exiting"; echo; exit 1; fi
+						Test_Splunk_HEC
+					;;
+					sync)
+						Check_Lock "$@"
+						if ! Check_IPSets || ! Check_IPTables; then echo "[*] Skynet Not Running - Exiting"; echo; exit 1; fi
+						if ! Is_Enabled "$splunkhec"; then
+							echo "[*] Splunk HEC not enabled"
+							echo; exit 1
+						fi
+						echo "[i] Syncing events to Splunk..."
+						if Send_To_Splunk; then
+							event_count="$(wc -l < "$skynetlog" 2>/dev/null || echo 0)"
+							echo "[i] Sync complete - processed $event_count log entries"
+						else
+							echo "[*] Sync failed"
+						fi
+					;;
+					exportti)
+						Check_Lock "$@"
+						if ! Check_IPSets || ! Check_IPTables; then echo "[*] Skynet Not Running - Exiting"; echo; exit 1; fi
+						Export_ThreatIntel
+					;;
+					status)
+						echo "[i] Splunk Integration Status"
+						echo "    HEC Enabled: $(if Is_Enabled "$splunkhec"; then Grn "Yes"; else Red "No"; fi)"
+						echo "    HEC URL: ${splunkhecurl:-Not configured}"
+						echo "    Index: ${splunkindex:-main}"
+						echo "    Sourcetype: ${splunksourcetype:-skynet:firewall}"
+						echo "    OTX API Key: $(if [ -n "$otxapikey" ]; then Grn "Configured"; else Ylow "Not set"; fi)"
+						if [ -f "${skynetloc}/.splunk_last_sent" ]; then
+							last_sync="$(cat "${skynetloc}/.splunk_last_sent")"
+							last_sync_date="$(date -d "@$last_sync" 2>/dev/null || echo "Unknown")"
+							echo "    Last Sync: $last_sync_date"
+						else
+							echo "    Last Sync: Never"
+						fi
+					;;
+					*)
+						echo "[*] Splunk Integration Commands:"
+						echo "    firewall settings splunk hec enable <url> <token> [index] [sourcetype]"
+						echo "    firewall settings splunk hec disable"
+						echo "    firewall settings splunk otxkey <api_key>"
+						echo "    firewall settings splunk test"
+						echo "    firewall settings splunk sync"
+						echo "    firewall settings splunk exportti"
+						echo "    firewall settings splunk status"
+						echo
+					;;
+				esac
+			;;
 			*)
 				Command_Not_Recognized
 			;;
@@ -6069,7 +6518,7 @@ case "$1" in
 
 				# Allowlist of safe functions that can be run via debug run
 				# These are utility and diagnostic functions that don't modify critical state
-				allowed_funcs="Check_Connection Check_Files Check_IPSets Check_IPTables Check_Lock Check_Security Check_Settings Check_Swap Display_Header Display_Message Display_Result Domain_Lookup Extended_DNSStats Filter_Date Filter_OutIP Filter_PrivateDST Filter_PrivateIP Filter_PrivateSRC Generate_Blocked_Events Generate_Stats Get_LocalName Get_WebUI_Page Is_ASN Is_Enabled Is_IP Is_IPRange Is_MAC Is_Numeric Is_Path Is_Port Is_PrivateIP Is_Range Is_URL LAN_CIDR_Lookup Load_Menu Print_Log Purge_Logs Refresh_AiProtect Refresh_MBans Refresh_MWhitelist Save_IPSets Show_Associated_Domains Strip_Domain Whitelist_CDN Whitelist_Extra Whitelist_Shared Whitelist_VPN WriteData_ToJS WriteStats_ToJS"
+				allowed_funcs="Check_Connection Check_Files Check_IPSets Check_IPTables Check_Lock Check_Security Check_Settings Check_Swap Display_Header Display_Message Display_Result Domain_Lookup Extended_DNSStats Export_ThreatIntel Fetch_OTX_Intel Filter_Date Filter_OutIP Filter_PrivateDST Filter_PrivateIP Filter_PrivateSRC Generate_Blocked_Events Generate_Stats Get_BanReason Get_LocalName Get_WebUI_Page Is_ASN Is_Enabled Is_IP Is_IPRange Is_MAC Is_Numeric Is_Path Is_Port Is_PrivateIP Is_Range Is_URL LAN_CIDR_Lookup Load_Menu Print_Log Purge_Logs Refresh_AiProtect Refresh_MBans Refresh_MWhitelist Save_IPSets Send_To_Splunk Show_Associated_Domains Strip_Domain Test_Splunk_HEC Whitelist_CDN Whitelist_Extra Whitelist_Shared Whitelist_VPN WriteData_ToJS WriteStats_ToJS"
 
 				# Check if function is in allowlist
 				allowed=0
