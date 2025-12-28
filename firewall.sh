@@ -875,6 +875,40 @@ Is_ASN() {
 	grep -qiE '^AS[0-9]{1,6}$'
 }
 
+Is_URL() {
+	# Validate URL format: must be http:// or https:// with valid domain characters
+	# Rejects URLs with shell metacharacters, path traversal, or suspicious patterns
+	url="$1"
+	# Must start with http:// or https://
+	case "$url" in
+		http://*|https://*) ;;
+		*) return 1 ;;
+	esac
+	# Reject dangerous shell metacharacters and path traversal
+	case "$url" in
+		*\`*|*\$\(*|*\;*|*\|*|*\&*|*\>*|*\<*|*\'*|*\"*|*\\*) return 1 ;;
+		*..*) return 1 ;;  # Reject path traversal
+	esac
+	# Basic domain/path character validation
+	echo "$url" | grep -qE '^https?://[a-zA-Z0-9][-a-zA-Z0-9.]*[a-zA-Z0-9](/[-a-zA-Z0-9_.~!*:@,;+?&=%#/]*)?$'
+}
+
+Is_Path() {
+	# Validate file path: must be absolute, no path traversal, no dangerous characters
+	path="$1"
+	# Must be an absolute path
+	case "$path" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	# Reject path traversal and dangerous patterns
+	case "$path" in
+		*../*|*\`*|*\$\(*|*\;*|*\|*|*\&*|*\>*|*\<*|*\'*|*\"*|*\\*) return 1 ;;
+	esac
+	# Validate characters in path
+	echo "$path" | grep -qE '^/[-a-zA-Z0-9_./]+$'
+}
+
 Is_Numeric() {
 	case "$1" in
 		*[!0-9]*) return 1 ;;  # If any non-digit, fail
@@ -897,47 +931,62 @@ LAN_CIDR_Lookup() {
 	fi
 }
 
+Get_BanReason() {
+	# Usage: Get_BanReason <ip_address>
+	# Returns the ban reason for an IP from the blacklist/blocked ranges
+	# Appends "*" if matched via CIDR range rather than exact IP
+	_ip="$1"
+	_reason="$(
+		grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" |
+		awk -v ip="$_ip" '
+			function trim(s) { sub(/^ +| +$/, "", s); return s }
+			function do_print(cidr) {
+				pos = index($0, "comment \"")
+				if (pos) {
+					s = substr($0, pos+9); sub(/"$/, "", s)
+					printf "%s", trim(s)
+					if (cidr) printf "*"
+					printf "\n"
+				}
+			}
+			BEGIN { split(ip,A,"."); ipn=A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4] }
+			# exact blacklist
+			$1=="add" && $2=="Skynet-Blacklist" && $3==ip { do_print(0); exit }
+			# CIDR ranges
+			$1=="add" && $2=="Skynet-BlockedRanges" {
+				split($3,P,"/"); net=P[1]; prefix=P[2]
+				split(net,B,"."); netn=B[1]*16777216 + B[2]*65536 + B[3]*256 + B[4]
+				if (prefix==32 && ipn==netn)              { do_print(0); exit }
+				else if (prefix==24 && A[1]==B[1]&&A[2]==B[2]&&A[3]==B[3]) { do_print(1); exit }
+				else if (prefix==16 && A[1]==B[1]&&A[2]==B[2])           { do_print(1); exit }
+				else if (prefix==8  && A[1]==B[1])                       { do_print(1); exit }
+				else {
+					sh=32-prefix; div=1
+					for(i=0;i<sh;i++) div*=2
+					if (int(ipn/div)==int(netn/div)) { do_print(1); exit }
+				}
+			}
+		'
+	)"
+	# Fallback: try to find a matching range via prefix lookup
+	if [ -z "$_reason" ]; then
+		_reason="$(grep -E "$(echo "$_ip" | cut -d '.' -f1-3)\..*/" "$skynetipset" | grep -m1 -vF "Skynet-Whitelist" | awk -F '"' '{print $2}' | sed "s~BanMalware: ~~g")*"
+	fi
+	# Truncate if too long
+	if [ "${#_reason}" -gt 45 ]; then
+		_reason="$(printf '%s' "$_reason" | cut -c1-45)"
+	fi
+	printf '%s' "$_reason"
+}
+
 Extended_DNSStats() {
 	case "$1" in
 		1)
 			if Is_Enabled "$lookupcountry"; then
 				country="$(curl -fsSL --retry 3 --max-time 6 -A "ASUSWRT-Merlin $model v$(nvram get buildno)_$(nvram get extendno)" "https://api.db-ip.com/v2/free/${statdata}/countryCode/" 2>/dev/null | grep -E '^[A-Z]{2}$' || echo '**')"
 			fi
-			# banreason: single AWK for both blacklist and CIDR, star only on CIDR
-			banreason="$(
-				grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" |
-				awk -v ip="$statdata" '
-					function trim(s) { sub(/^ +| +$/, "", s); return s }
-					function do_print(cidr) {
-					pos = index($0, "comment \"")
-					if (pos) {
-						s = substr($0, pos+9); sub(/"$/, "", s)
-						printf "%s", trim(s)
-						if (cidr) printf "*"
-						printf "\n"
-					}
-					}
-					BEGIN { split(ip,A,"."); ipn=A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4] }
-					# exact blacklist
-					$1=="add" && $2=="Skynet-Blacklist" && $3==ip { do_print(0); exit }
-					# CIDR ranges
-					$1=="add" && $2=="Skynet-BlockedRanges" {
-					split($3,P,"/"); net=P[1]; prefix=P[2]
-					split(net,B,"."); netn=B[1]*16777216 + B[2]*65536 + B[3]*256 + B[4]
-					if (prefix==32 && ipn==netn)              { do_print(0); exit }
-					else if (prefix==24 && A[1]==B[1]&&A[2]==B[2]&&A[3]==B[3]) { do_print(1); exit }
-					else if (prefix==16 && A[1]==B[1]&&A[2]==B[2])           { do_print(1); exit }
-					else if (prefix==8  && A[1]==B[1])                       { do_print(1); exit }
-					else {
-						sh=32-prefix; div=1
-						for(i=0;i<sh;i++) div*=2
-						if (int(ipn/div)==int(netn/div)) { do_print(1); exit }
-					}
-					}
-				'
-			)"
-			[ -z "$banreason" ] && ! ipset -q test Skynet-Blacklist "$ipaddr" && ! ipset -q test Skynet-BlockedRanges "$ipaddr" && banreason="No Longer Blacklisted"
-			[ "${#banreason}" -gt 45 ] && banreason="$(printf '%s' "$banreason" | cut -c1-45)"
+			banreason="$(Get_BanReason "$statdata")"
+			[ -z "$banreason" ] && ! ipset -q test Skynet-Blacklist "$statdata" && ! ipset -q test Skynet-BlockedRanges "$statdata" && banreason="No Longer Blacklisted"
 			printf '%-15s %-4s | %-55s | %-45s | %-60s \n' "$statdata" "$country" "https://otx.alienvault.com/indicator/ip/${statdata}" "$banreason" "$(grep -F "$statdata" /tmp/skynet/skynetstats.txt | awk '{print $1}' | xargs)"
 		;;
 		2)
@@ -946,41 +995,8 @@ Extended_DNSStats() {
 			if Is_Enabled "$lookupcountry"; then
 				country="$(curl -fsSL --retry 3 --max-time 6 -A "ASUSWRT-Merlin $model v$(nvram get buildno)_$(nvram get extendno)" "https://api.db-ip.com/v2/free/${ipaddr}/countryCode/" 2>/dev/null | grep -E '^[A-Z]{2}$' || echo '**')"
 			fi
-			# banreason: single AWK for both blacklist and CIDR, star only on CIDR
-			banreason="$(
-				grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" |
-				awk -v ip="$ipaddr" '
-					function trim(s) { sub(/^ +| +$/, "", s); return s }
-					function do_print(cidr) {
-					pos = index($0, "comment \"")
-					if (pos) {
-						s = substr($0, pos+9); sub(/"$/, "", s)
-						printf "%s", trim(s)
-						if (cidr) printf "*"
-						printf "\n"
-					}
-					}
-					BEGIN { split(ip,A,"."); ipn=A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4] }
-					# exact blacklist
-					$1=="add" && $2=="Skynet-Blacklist" && $3==ip { do_print(0); exit }
-					# CIDR ranges
-					$1=="add" && $2=="Skynet-BlockedRanges" {
-					split($3,P,"/"); net=P[1]; prefix=P[2]
-					split(net,B,"."); netn=B[1]*16777216 + B[2]*65536 + B[3]*256 + B[4]
-					if (prefix==32 && ipn==netn)              { do_print(0); exit }
-					else if (prefix==24 && A[1]==B[1]&&A[2]==B[2]&&A[3]==B[3]) { do_print(1); exit }
-					else if (prefix==16 && A[1]==B[1]&&A[2]==B[2])           { do_print(1); exit }
-					else if (prefix==8  && A[1]==B[1])                       { do_print(1); exit }
-					else {
-						sh=32-prefix; div=1
-						for(i=0;i<sh;i++) div*=2
-						if (int(ipn/div)==int(netn/div)) { do_print(1); exit }
-					}
-					}
-				'
-			)"
+			banreason="$(Get_BanReason "$ipaddr")"
 			[ -z "$banreason" ] && ! ipset -q test Skynet-Blacklist "$ipaddr" && ! ipset -q test Skynet-BlockedRanges "$ipaddr" && banreason="No Longer Blacklisted"
-			[ "${#banreason}" -gt 45 ] && banreason="$(printf '%s' "$banreason" | cut -c1-45)"
 			printf '%-10s | %-15s %-4s | %-55s | %-45s | %-60s\n' "${hits}x" "$ipaddr" "$country" "https://otx.alienvault.com/indicator/ip/${ipaddr}" "$banreason" "$(grep -F "$ipaddr" /tmp/skynet/skynetstats.txt | awk '{print $1}' | xargs)"
 		;;
 		*)
@@ -1984,42 +2000,7 @@ Generate_Stats() {
 			# last 10 Connections Blocked Inbound
 			true > "${skynetloc}/webui/stats/liconn.txt"
 			grep -F "INBOUND" "$skynetlog" | grep -oE ' SRC=[0-9,\.]*' | cut -c 6- | awk '{a[i++]=$0} END {for (j=i-1; j>=0;) print a[j--] }' | awk '!x[$0]++' | head -10 | while IFS= read -r "statdata"; do
-				banreason="$(
-					grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" |
-					awk -v ip="$statdata" '
-						function trim(s) { sub(/^ +| +$/, "", s); return s }
-						function do_print(cidr) {
-						pos = index($0, "comment \"")
-						if (pos) {
-							s = substr($0, pos+9); sub(/"$/, "", s)
-							printf "%s", trim(s)
-							if (cidr) printf "*"
-							printf "\n"
-						}
-						}
-						BEGIN { split(ip,A,"."); ipn=A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4] }
-						# exact blacklist
-						$1=="add" && $2=="Skynet-Blacklist" && $3==ip { do_print(0); exit }
-						# CIDR ranges
-						$1=="add" && $2=="Skynet-BlockedRanges" {
-						split($3,P,"/"); net=P[1]; prefix=P[2]
-						split(net,B,"."); netn=B[1]*16777216 + B[2]*65536 + B[3]*256 + B[4]
-						if (prefix==32 && ipn==netn)              { do_print(0); exit }
-						else if (prefix==24 && A[1]==B[1]&&A[2]==B[2]&&A[3]==B[3]) { do_print(1); exit }
-						else if (prefix==16 && A[1]==B[1]&&A[2]==B[2])           { do_print(1); exit }
-						else if (prefix==8  && A[1]==B[1])                       { do_print(1); exit }
-						else {
-							sh=32-prefix; div=1
-							for(i=0;i<sh;i++) div*=2
-							if (int(ipn/div)==int(netn/div)) { do_print(1); exit }
-						}
-						}
-					'
-				)"
-				if [ -z "$banreason" ]; then
-					banreason="$(grep -E "$(echo "$statdata" | cut -d '.' -f1-3)\..*/" "$skynetipset" | grep -m1 -vF "Skynet-Whitelist" | awk -F '"' '{print $2}' | sed "s~BanMalware: ~~g")*"
-				fi
-				if [ "${#banreason}" -gt "45" ]; then banreason="$(echo "$banreason" | cut -c 1-45)"; fi
+				banreason="$(Get_BanReason "$statdata")"
 				alienvault="https://otx.alienvault.com/indicator/ip/${statdata}"
 				if Is_Enabled "$lookupcountry"; then
 					country="$(curl -fsSL --retry 3 --max-time 6 -A "ASUSWRT-Merlin $model v$(nvram get buildno)_$(nvram get extendno)" "https://api.db-ip.com/v2/free/${statdata}/countryCode/" 2>/dev/null | grep -E '^[A-Z]{2}$' || echo '**')"
@@ -2032,42 +2013,7 @@ Generate_Stats() {
 			# Last 10 Connections Blocked Outbound
 			true > "${skynetloc}/webui/stats/loconn.txt"
 			grep -F "OUTBOUND" "$skynetlog" | grep -vE 'DPT=80 |DPT=443 ' | grep -oE ' DST=[0-9,\.]*' | cut -c 6- | awk '{a[i++]=$0} END {for (j=i-1; j>=0;) print a[j--] }' | awk '!x[$0]++' | head -10 | while IFS= read -r "statdata"; do
-				banreason="$(
-					grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" |
-					awk -v ip="$statdata" '
-						function trim(s) { sub(/^ +| +$/, "", s); return s }
-						function do_print(cidr) {
-						pos = index($0, "comment \"")
-						if (pos) {
-							s = substr($0, pos+9); sub(/"$/, "", s)
-							printf "%s", trim(s)
-							if (cidr) printf "*"
-							printf "\n"
-						}
-						}
-						BEGIN { split(ip,A,"."); ipn=A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4] }
-						# exact blacklist
-						$1=="add" && $2=="Skynet-Blacklist" && $3==ip { do_print(0); exit }
-						# CIDR ranges
-						$1=="add" && $2=="Skynet-BlockedRanges" {
-						split($3,P,"/"); net=P[1]; prefix=P[2]
-						split(net,B,"."); netn=B[1]*16777216 + B[2]*65536 + B[3]*256 + B[4]
-						if (prefix==32 && ipn==netn)              { do_print(0); exit }
-						else if (prefix==24 && A[1]==B[1]&&A[2]==B[2]&&A[3]==B[3]) { do_print(1); exit }
-						else if (prefix==16 && A[1]==B[1]&&A[2]==B[2])           { do_print(1); exit }
-						else if (prefix==8  && A[1]==B[1])                       { do_print(1); exit }
-						else {
-							sh=32-prefix; div=1
-							for(i=0;i<sh;i++) div*=2
-							if (int(ipn/div)==int(netn/div)) { do_print(1); exit }
-						}
-						}
-					'
-				)"
-				if [ -z "$banreason" ]; then
-					banreason="$(grep -E "$(echo "$statdata" | cut -d '.' -f1-3)\..*/" "$skynetipset" | grep -m1 -vF "Skynet-Whitelist" | awk -F '"' '{print $2}' | sed "s~BanMalware: ~~g")*"
-				fi
-				if [ "${#banreason}" -gt "45" ]; then banreason="$(echo "$banreason" | cut -c 1-45)"; fi
+				banreason="$(Get_BanReason "$statdata")"
 				alienvault="https://otx.alienvault.com/indicator/ip/${statdata}"
 				if Is_Enabled "$lookupcountry"; then
 					country="$(curl -fsSL --retry 3 --max-time 6 -A "ASUSWRT-Merlin $model v$(nvram get buildno)_$(nvram get extendno)" "https://api.db-ip.com/v2/free/${statdata}/countryCode/" 2>/dev/null | grep -E '^[A-Z]{2}$' || echo '**')"
@@ -2080,42 +2026,7 @@ Generate_Stats() {
 			# Last 10 HTTP Connections Blocked Outbound
 			true > "${skynetloc}/webui/stats/lhconn.txt"
 			grep -E 'DPT=80 |DPT=443 ' "$skynetlog" | grep -F "OUTBOUND" | grep -oE ' DST=[0-9,\.]*' | cut -c 6- | awk '{a[i++]=$0} END {for (j=i-1; j>=0;) print a[j--] }' | awk '!x[$0]++' | head -10 | while IFS= read -r "statdata"; do
-				banreason="$(
-					grep -E '^add Skynet-(Blacklist|BlockedRanges) ' "$skynetipset" |
-					awk -v ip="$statdata" '
-						function trim(s) { sub(/^ +| +$/, "", s); return s }
-						function do_print(cidr) {
-						pos = index($0, "comment \"")
-						if (pos) {
-							s = substr($0, pos+9); sub(/"$/, "", s)
-							printf "%s", trim(s)
-							if (cidr) printf "*"
-							printf "\n"
-						}
-						}
-						BEGIN { split(ip,A,"."); ipn=A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4] }
-						# exact blacklist
-						$1=="add" && $2=="Skynet-Blacklist" && $3==ip { do_print(0); exit }
-						# CIDR ranges
-						$1=="add" && $2=="Skynet-BlockedRanges" {
-						split($3,P,"/"); net=P[1]; prefix=P[2]
-						split(net,B,"."); netn=B[1]*16777216 + B[2]*65536 + B[3]*256 + B[4]
-						if (prefix==32 && ipn==netn)              { do_print(0); exit }
-						else if (prefix==24 && A[1]==B[1]&&A[2]==B[2]&&A[3]==B[3]) { do_print(1); exit }
-						else if (prefix==16 && A[1]==B[1]&&A[2]==B[2])           { do_print(1); exit }
-						else if (prefix==8  && A[1]==B[1])                       { do_print(1); exit }
-						else {
-							sh=32-prefix; div=1
-							for(i=0;i<sh;i++) div*=2
-							if (int(ipn/div)==int(netn/div)) { do_print(1); exit }
-						}
-						}
-					'
-				)"
-				if [ -z "$banreason" ]; then
-					banreason="$(grep -E "$(echo "$statdata" | cut -d '.' -f1-3)\..*/" "$skynetipset" | grep -m1 -vF "Skynet-Whitelist" | awk -F '"' '{print $2}' | sed "s~BanMalware: ~~g")*"
-				fi
-				if [ "${#banreason}" -gt "45" ]; then banreason="$(echo "$banreason" | cut -c 1-45)"; fi
+				banreason="$(Get_BanReason "$statdata")"
 				alienvault="https://otx.alienvault.com/indicator/ip/${statdata}"
 				if Is_Enabled "$lookupcountry"; then
 					country="$(curl -fsSL --retry 3 --max-time 6 -A "ASUSWRT-Merlin $model v$(nvram get buildno)_$(nvram get extendno)" "https://api.db-ip.com/v2/free/${statdata}/countryCode/" 2>/dev/null | grep -E '^[A-Z]{2}$' || echo '**')"
@@ -3640,7 +3551,7 @@ Load_Menu() {
 													if ! echo "$port" | Is_Port; then echo "[*] $port Is Not A Valid Port"; echo; unset "option3" "option4"; continue 2; fi
 											done
 										else
-											if ! echo "$option4" | Is_Port; then echo "[*] $port Is Not A Valid Port"; echo; unset "option3" "option4"; continue; fi
+											if ! echo "$option4" | Is_Port; then echo "[*] $option4 Is Not A Valid Port"; echo; unset "option3" "option4"; continue; fi
 										fi
 										break
 									;;
@@ -4569,6 +4480,11 @@ case "$1" in
 			unset "customlisturl"
 		fi
 		if [ -n "$2" ] && [ "$2" != "reset" ] && [ "$1" != "fs" ]; then
+			if ! Is_URL "$2"; then
+				echo "[*] Invalid URL Format: $2"
+				echo "[*] URLs must start with http:// or https:// and contain valid characters"
+				echo; exit 2
+			fi
 			customlisturl="$2"
 			listurl="$customlisturl"
 			echo "[i] Custom Filter Detected: $customlisturl"
@@ -4580,6 +4496,11 @@ case "$1" in
 				fastswitch="enabled"
 				echo "[i] Fast Switch List Enabled"
 				if [ -z "$customlist2url" ] || [ -n "$2" ]; then
+					if ! Is_URL "$2"; then
+						echo "[*] Invalid URL Format: $2"
+						echo "[*] URLs must start with http:// or https:// and contain valid characters"
+						echo; exit 2
+					fi
 					customlist2url="$2"
 					listurl="$customlist2url"
 				else
@@ -4653,7 +4574,10 @@ case "$1" in
 			}
 		' /jffs/addons/shared-whitelists/shared-Skynet-whitelist > /tmp/skynet/skynet.manifest
 
-		# Download all feeds in parallel
+		# Download all feeds in parallel with concurrency limit
+		# Limit to 5 concurrent downloads to prevent resource exhaustion on routers
+		MAX_PARALLEL=5
+		active_jobs=0
 		while IFS=' ' read -r url list || [ -n "$url" ]; do
 			(
 				[ -n "$url" ] || exit 0
@@ -4661,6 +4585,12 @@ case "$1" in
 					-o "${skynetloc}/lists/$list" 2>/dev/null \
 				&& echo "[✔] Downloaded $url" || echo "[✘] Failed to fetch: $url"
 			) &
+			active_jobs=$((active_jobs + 1))
+			# Wait for some jobs to complete if we've hit the limit
+			if [ "$active_jobs" -ge "$MAX_PARALLEL" ]; then
+				wait -n 2>/dev/null || wait  # wait -n not available on all shells, fallback to wait
+				active_jobs=$((active_jobs - 1))
+			fi
 		done < /tmp/skynet/skynet.manifest
 		wait
 
@@ -5408,6 +5338,11 @@ case "$1" in
 						syslogloc="/tmp/syslog.log"
 					;;
 					*)
+						if ! Is_Path "$3"; then
+							echo "[*] Invalid Path: $3"
+							echo "[*] Paths must be absolute (start with /), contain no path traversal (..), and use valid characters"
+							echo; exit 2
+						fi
 						syslogloc="$3"
 					;;
 				esac
@@ -5422,6 +5357,11 @@ case "$1" in
 						syslog1loc="/tmp/syslog.log-1"
 					;;
 					*)
+						if ! Is_Path "$3"; then
+							echo "[*] Invalid Path: $3"
+							echo "[*] Paths must be absolute (start with /), contain no path traversal (..), and use valid characters"
+							echo; exit 2
+						fi
 						syslog1loc="$3"
 					;;
 				esac
@@ -5757,7 +5697,7 @@ case "$1" in
 						echo "[i] Filtering Entries Involving Port $4"
 						echo
 						tail -F "$syslogloc" | while read -r logoutput; do
-							if echo "$logoutput" | grep -qE "INAVLID.*PT=$4 "; then
+							if echo "$logoutput" | grep -qE "INVALID.*PT=$4 "; then
 								Blue "$logoutput"
 								if Is_Enabled "$extendedstats"; then
 									domainlist="$(grep -E "reply.* is $(echo "$logoutput" | grep -oE ' DST=[0-9,\.]* ' | cut -c 6- | sed 's/.$//' | sed 's~\.~\\.~g')" /opt/var/log/dnsmasq* | awk '{print $(NF-2)}' | Strip_Domain | Filter_OutIP | xargs)"
@@ -6124,8 +6064,27 @@ case "$1" in
 			run)
 				Check_Lock "$@"
 				func="$3"
-				# Shift off “run” and the sub‐command name, leaving any extra args in $@
+				# Shift off "run" and the sub‐command name, leaving any extra args in $@
 				shift 3
+
+				# Allowlist of safe functions that can be run via debug run
+				# These are utility and diagnostic functions that don't modify critical state
+				allowed_funcs="Check_Connection Check_Files Check_IPSets Check_IPTables Check_Lock Check_Security Check_Settings Check_Swap Display_Header Display_Message Display_Result Domain_Lookup Extended_DNSStats Filter_Date Filter_OutIP Filter_PrivateDST Filter_PrivateIP Filter_PrivateSRC Generate_Blocked_Events Generate_Stats Get_LocalName Get_WebUI_Page Is_ASN Is_Enabled Is_IP Is_IPRange Is_MAC Is_Numeric Is_Path Is_Port Is_PrivateIP Is_Range Is_URL LAN_CIDR_Lookup Load_Menu Print_Log Purge_Logs Refresh_AiProtect Refresh_MBans Refresh_MWhitelist Save_IPSets Show_Associated_Domains Strip_Domain Whitelist_CDN Whitelist_Extra Whitelist_Shared Whitelist_VPN WriteData_ToJS WriteStats_ToJS"
+
+				# Check if function is in allowlist
+				allowed=0
+				for allowed_func in $allowed_funcs; do
+					if [ "$func" = "$allowed_func" ]; then
+						allowed=1
+						break
+					fi
+				done
+
+				if [ "$allowed" != "1" ]; then
+					echo "[!] Function ${func}() is not in the allowed function list"
+					echo "[i] Allowed functions: $allowed_funcs"
+					echo; exit 2
+				fi
 
 				# Verify the function exists in this script
 				if grep -qE "^[[:space:]]*${func}[[:space:]]*\(\)" "$0"; then
