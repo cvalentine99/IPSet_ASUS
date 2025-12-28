@@ -1,0 +1,17 @@
+{
+    "otx_api_key": "",
+    "otx_base_url": "https://otx.alienvault.com/api/v1",
+    "pulse_days": 30,
+    "indicator_types": ["IPv4", "IPv6", "domain", "hostname", "URL", "FileHash-MD5", "FileHash-SHA1", "FileHash-SHA256"],
+    "splunk_hec_url": "https://localhost:8088/services/collector/event",
+    "splunk_hec_token": "",
+    "splunk_index": "threat_activity",
+    "splunk_sourcetype": "stash",
+    "splunk_source": "OTX:AlienVault",
+    "batch_size": 500,
+    "verify_ssl": true,
+    "log_level": "INFO",
+    "threat_collection_name": "otx_alienvault",
+    "default_confidence": 70,
+    "default_weight": 1
+}
