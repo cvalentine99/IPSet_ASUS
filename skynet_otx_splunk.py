@@ -82,9 +82,10 @@ ES_RECOMMENDED_FIELDS = [
 class OTXClient:
     """AlienVault OTX API client."""
 
-    def __init__(self, api_key: str, base_url: str = "https://otx.alienvault.com/api/v1"):
+    def __init__(self, api_key: str, base_url: str = "https://otx.alienvault.com/api/v1", verify_ssl: bool = False):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
+        self.verify_ssl = verify_ssl
 
     def _make_request(self, endpoint: str) -> Optional[Dict]:
         """Make authenticated request to OTX API."""
@@ -94,7 +95,10 @@ class OTXClient:
         try:
             req = Request(url, headers=headers)
             ctx = ssl.create_default_context()
-            with urlopen(req, context=ctx, timeout=30) as response:
+            if not self.verify_ssl:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            with urlopen(req, context=ctx, timeout=60) as response:
                 return json.loads(response.read().decode('utf-8'))
         except HTTPError as e:
             logger.error(f"HTTP error fetching {url}: {e.code}")
@@ -475,7 +479,8 @@ def main():
     logger.info("Starting OTX fetch...")
     otx_client = OTXClient(
         api_key=config["otx_api_key"],
-        base_url=config.get("otx_base_url", "https://otx.alienvault.com/api/v1")
+        base_url=config.get("otx_base_url", "https://otx.alienvault.com/api/v1"),
+        verify_ssl=config.get("verify_ssl", False)
     )
     pulses = otx_client.get_subscribed_pulses(days=config.get("pulse_days", 30))
 
